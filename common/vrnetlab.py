@@ -12,7 +12,10 @@ import subprocess
 import sys
 import telnetlib
 import time
+from collections import namedtuple
+from enum import IntEnum, StrEnum
 from pathlib import Path
+from typing import cast
 
 try:
     from scrapli import Driver
@@ -80,6 +83,169 @@ def boot_delay():
         time.sleep(int(delay))
 
 
+def get_disk_size_int(size: str | int) -> int:
+    "Returns the int size of a disk size"
+    if isinstance(size, str):
+        try:
+            suffix: int = DiskSuffixes[size[-1].upper()]
+        except KeyError:
+            raise ValueError(f"Invalid size suffix {size[-1]}")
+        return int(size[:-1]) * suffix
+    return size
+
+
+class DiskImageFormats(StrEnum):
+    RAW = "raw"
+    QCOW2 = "qcow2"
+    VMDK = "vmdk"
+    VDI = "vdi"
+    VHD = "vhd"
+    VHDX = "vhdx"
+
+
+class DiskSuffixes(IntEnum):
+    B = 1
+    K = B * 1024
+    M = K * 1024
+    G = M * 1024
+    T = G * 1024
+
+
+class DiskImageBase:
+    """
+    A disk image and management functions
+    """
+
+    __image_info: dict | None = None
+
+    def __init__(self, path: Path, size: str | int) -> None:
+        """
+        path: Path to the disk image
+        size: Size to set the image in bytes or with a suffix K,M,G,T https://qemu-project.gitlab.io/qemu/tools/qemu-img.html
+        """
+        self.path: Path = path
+        self.__size: str | int = size
+        if not self._check_size(size):
+            logging.debug(
+                "Requested size is smaller than existing disk size path=%s", self.path
+            )
+            self.__size = self.image_info["virtual-size"]
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(path={self.path},size={self.size})"
+
+    def _check_size(self, size: str | int) -> bool:
+        "Checks that the requested size is larger than the base image size"
+        image_size: int = self.image_info["virtual-size"]
+        return get_disk_size_int(size) >= image_size
+
+    @property
+    def image_info(self) -> dict:
+        if not self.__image_info:
+            try:
+                res = subprocess.run(
+                    ["qemu-img", "info", "--output", "json", self.path],
+                    check=True,
+                    capture_output=True,
+                )
+            except subprocess.CalledProcessError as e:
+                raise ValueError(f"Could not read image format for {self.path}") from e
+
+            self.__image_info = cast(dict, json.loads(res.stdout))
+        return self.__image_info
+
+    @property
+    def size(self) -> str | int:
+        return self.__size
+
+    @property
+    def dir(self) -> Path:
+        return self.path.parent
+
+    @property
+    def type(self) -> DiskImageFormats:
+        return self.image_info["format"]
+
+
+class DiskImageOverlay(DiskImageBase):
+    """
+    Overlay image for a DiskImage
+    """
+
+    def __init__(self, path: Path, size: str | int, parent: "DiskImage"):
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            run_command(
+                [
+                    "qemu-img",
+                    "create",
+                    "-f",
+                    "qcow2",
+                    "-o",
+                    "compression_type=zstd",
+                    "-b",
+                    str(parent.path.absolute()),
+                    "-F",
+                    parent.type,
+                    str(path),
+                    str(size),
+                ]
+            )
+        super().__init__(path, size)
+
+    @property
+    def size(self) -> str | int:
+        return super().size
+
+    @size.setter
+    def size(self, size: str | int):
+        "Resize the disk"
+        if self._check_size(size):
+            try:
+                subprocess.run(
+                    ["qemu-img", "resize", str(self.path), str(size)],
+                    capture_output=True,
+                    check=True,
+                )
+                logging.info(
+                    "Resize successful. Please expand the filesystem in the guest"
+                )
+            except subprocess.CalledProcessError as e:
+                logging.error("Failed to resize disk image: %s", self.path)
+                logging.error(
+                    "Resize command output stdout=%s stderr=%s", e.stdout, e.stderr
+                )
+        else:
+            logging.error(
+                "Requested size is smaller than existing size. No changes made"
+            )
+
+
+class DiskImage(DiskImageBase):
+    """
+    Main disk image
+    """
+
+    def __init__(self, path: Path, size: str | int = "5G"):
+        super().__init__(path, size)
+        self.overlay: DiskImageOverlay = DiskImageOverlay(
+            self.path.parent / "overlay" / f"{self.path.stem}-overlay.qcow2",
+            self.size,
+            self,
+        )
+
+    @property
+    def size(self) -> str | int:
+        return self.overlay.size
+
+    @size.setter
+    def size(self, size: str | int):
+        self.overlay.size = size
+
+
 class VM:
     def __str__(self):
         return self.__class__.__name__
@@ -119,11 +285,13 @@ class VM:
         will write all channel i/o as DEBUG log level.
         """
         self.scrapli_logger = logging.getLogger("scrapli")
-        
-        scrapli_log_level = logging.DEBUG if os.getenv("DEBUG_SCRAPLI", "false").lower() == "true" else logging.INFO
+
+        scrapli_log_level = (
+            logging.DEBUG
+            if os.getenv("DEBUG_SCRAPLI", "false").lower() == "true"
+            else logging.INFO
+        )
         self.scrapli_logger.setLevel(scrapli_log_level)
-        
-        
 
         # configure scrapli
         if self.use_scrapli:
