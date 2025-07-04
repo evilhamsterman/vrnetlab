@@ -26,6 +26,9 @@ MAX_RETRIES = 60
 
 DEFAULT_SCRAPLI_TIMEOUT = 900
 
+type PathStr = str | Path
+type DiskSize = str | int
+
 # set fancy logging colours
 logging.addLevelName(
     logging.INFO, f"\x1b[1;32m\t{logging.getLevelName(logging.INFO)}\x1b[0m"
@@ -83,7 +86,7 @@ def boot_delay():
         time.sleep(int(delay))
 
 
-def get_disk_size_int(size: str | int) -> int:
+def get_disk_size_int(size: DiskSize) -> int:
     "Returns the int size of a disk size"
     if isinstance(size, str):
         try:
@@ -111,20 +114,20 @@ class DiskSuffixes(IntEnum):
     T = G * 1024
 
 
-class DiskImageBase:
+class DiskImage:
     """
     A disk image and management functions
     """
 
     __image_info: dict | None = None
 
-    def __init__(self, path: Path, size: str | int) -> None:
+    def __init__(self, path: PathStr, size: DiskSize) -> None:
         """
         path: Path to the disk image
         size: Size to set the image in bytes or with a suffix K,M,G,T https://qemu-project.gitlab.io/qemu/tools/qemu-img.html
         """
-        self.path: Path = path
-        self.__size: str | int = size
+        self.path: Path = Path(path)
+        self.__size: DiskSize = size
         if not self._check_size(size):
             logging.debug(
                 "Requested size is smaller than existing disk size path=%s", self.path
@@ -132,12 +135,12 @@ class DiskImageBase:
             self.__size = self.image_info["virtual-size"]
 
     def __str__(self) -> str:
-        return str(self.path)
+        return str(self.path.absolute())
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(path={self.path},size={self.size})"
 
-    def _check_size(self, size: str | int) -> bool:
+    def _check_size(self, size: DiskSize) -> bool:
         "Checks that the requested size is larger than the base image size"
         image_size: int = self.image_info["virtual-size"]
         return get_disk_size_int(size) >= image_size
@@ -170,12 +173,15 @@ class DiskImageBase:
         return self.image_info["format"]
 
 
-class DiskImageOverlay(DiskImageBase):
+class DiskImageOverlay(DiskImage):
     """
     Overlay image for a DiskImage
     """
 
-    def __init__(self, path: Path, size: str | int, parent: "DiskImage"):
+    def __init__(self, path: PathStr, parent: DiskImage, size: DiskSize | None = None):
+        if not size:
+            size = parent.size
+        path = Path(path)
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
             run_command(
@@ -201,7 +207,7 @@ class DiskImageOverlay(DiskImageBase):
         return super().size
 
     @size.setter
-    def size(self, size: str | int):
+    def size(self, size: DiskSize):
         "Resize the disk"
         if self._check_size(size):
             try:
@@ -224,45 +230,16 @@ class DiskImageOverlay(DiskImageBase):
             )
 
 
-class DiskImage(DiskImageBase):
-    """
-    Main disk image
-    """
-
-    def __init__(self, path: Path, size: str | int = "5G"):
-        super().__init__(path, size)
-        self.overlay: DiskImageOverlay = DiskImageOverlay(
-            self.path.parent / "overlay" / f"{self.path.stem}-overlay.qcow2",
-            self.size,
-            self,
-        )
-
-    @property
-    def size(self) -> str | int:
-        return self.overlay.size
-
-    @size.setter
-    def size(self, size: str | int):
-        self.overlay.size = size
-
-
 class VM:
     def __str__(self):
         return self.__class__.__name__
-
-    def _overlay_disk_image_format(self) -> str:
-        res = run_command(["qemu-img", "info", "--output", "json", self.image])
-        if res is not None:
-            image_info = json.loads(res[0])
-            if "format" in image_info:
-                return image_info["format"]
-        raise ValueError(f"Could not read image format for {self.image}")
 
     def __init__(
         self,
         username,
         password,
-        disk_image="",
+        disk_image: DiskImage,
+        disk_size: DiskSize | None = None,
         num=0,
         ram=4096,
         driveif="ide",
@@ -273,6 +250,7 @@ class VM:
         mgmt_dhcp=False,
         min_dp_nics=0,
         use_scrapli=False,
+        role: str | None = None,
     ):
         self.use_scrapli = use_scrapli
 
@@ -328,7 +306,7 @@ class VM:
         self.password = password
 
         self.num = num
-        self.image = disk_image
+        self.disk_image: DiskImage = disk_image
 
         self.running = False
         self.spins = 0
@@ -344,6 +322,7 @@ class VM:
         self.fake_start_date = None
         self.nic_type = "e1000"
         self.num_nics = 0
+        self.role: str | None = role
         # number of nics that are actually *provisioned* (as in nics that will be added to container)
         self.num_provisioned_nics = int(os.environ.get("CLAB_INTFS", 0))
         # "highest" provisioned nic num -- used for making sure we can allocate nics without needing
@@ -419,31 +398,18 @@ class VM:
         # wait_pattern is the pattern we wait on the serial connection when pushing config commands
         self.wait_pattern = "#"
 
-        overlay_disk_image = re.sub(r"(\.[^.]+$)", r"-overlay\1", disk_image)
+        overlay_dir: Path = self.disk_image.dir.absolute()
         # append role to overlay name to have different overlay images for control and data plane images
-        if hasattr(self, "role"):
-            tokens = overlay_disk_image.split(".")
-            tokens[0] = tokens[0] + "-" + self.role + str(self.num)
-            overlay_disk_image = ".".join(tokens)
+        if self.role:
+            overlay_disk_path: Path = (
+                overlay_dir / f"{self.disk_image}-{self.role}-overlay.qcow2"
+            )
+        else:
+            overlay_disk_path: Path = overlay_dir / f"{self.disk_image}-overlay.qcow2"
 
-        if not os.path.exists(overlay_disk_image):
-            self.logger.debug(
-                f"class: {self.__class__.__name__}, disk_image: {disk_image}, overlay: {overlay_disk_image}"
-            )
-            self.logger.debug("Creating overlay disk image")
-            run_command(
-                [
-                    "qemu-img",
-                    "create",
-                    "-f",
-                    "qcow2",
-                    "-F",
-                    self._overlay_disk_image_format(),
-                    "-b",
-                    disk_image,
-                    overlay_disk_image,
-                ]
-            )
+        overlay_disk: DiskImageOverlay = DiskImageOverlay(
+            overlay_disk_path, self.disk_image, disk_size
+        )
 
         self.qemu_args = [
             "qemu-system-x86_64",
@@ -462,7 +428,7 @@ class VM:
             "-smp",
             self.smp,  # cpu core configuration
             "-drive",
-            f"if={driveif},file={overlay_disk_image}",
+            f"if={driveif},file={overlay_disk}",
         ]
 
         # add additional qemu args if they were provided
@@ -852,7 +818,7 @@ class VM:
 
             # calc which PCI bus we are on and the local add on that PCI bus
             x = pci_bus_ctr
-            if "vEOS" in self.image:
+            if "vEOS" in str(self.disk_image.path):
                 x = pci_bus_ctr + 1
 
             pci_bus = math.floor(x / self.nics_per_pci_bus) + 1
