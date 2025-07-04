@@ -15,7 +15,7 @@ import time
 from collections import namedtuple
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 try:
     from scrapli import Driver
@@ -26,8 +26,8 @@ MAX_RETRIES = 60
 
 DEFAULT_SCRAPLI_TIMEOUT = 900
 
-type PathStr = str | Path
-type DiskSize = str | int
+PathStr: TypeAlias = str | Path
+DiskSize: TypeAlias = str | int
 
 # set fancy logging colours
 logging.addLevelName(
